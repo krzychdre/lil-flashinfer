@@ -296,21 +296,23 @@ def _pack_topk_routes_sort_kernel(
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
 
 
-# [determinism] Nakładka overlay/determinism (D2). Oryginalne jądro wyżej nadaje
-# trasie miejsce w segmencie eksperta przez tl.atomic_add z wielu wątków/CTA, więc
-# kolejność tras w obrębie eksperta (a z nią kolejność sumowania w GEMM-ach MoE)
-# zależy od przebiegu. Zamiennik: trasa i dostaje miejsce
+# [determinism] Run-to-run determinism patch: stable MoE route packing. The
+# original kernel above gives each route its slot in the expert's segment with
+# tl.atomic_add from many threads/CTAs, so the order of routes within an expert
+# (and with it the summation order in the MoE GEMMs) changes from run to run.
+# Replacement: route i gets the slot
 #   expert_offsets[e] + #{j < i : ids[j] == e},
-# czyli trasy jednego eksperta leżą rosnąco po indeksie trasy. Dwa jądra, O(n):
-#   1. _det_route_block_hist_kernel: histogram tras bloku BLOCK_T po ekspertach
-#      -> hist[blok, e] (bez atomików; tylko gdy bloków > 1);
-#   2. _det_route_place_kernel: ranga w bloku (porównania w kaflach) + suma
-#      hist[b < pid, e] -> zapis do packed_route_indices.
-# Bez synchronizacji z hostem: działa w grafach CUDA (hist z torch.empty z puli
-# grafu). Różnica kontraktu: expert_offsets NIE jest przesuwany (zostaje prefiksem
-# z jądra prefix/small_prefix); w tym obrazie nikt go nie czyta po pakowaniu.
-# Przełącznik diagnostyczny czytany raz przy imporcie (domyślnie 1):
-#   B12X_DETERMINISM_ROUTE_PACK=0 -> oryginalne jądro atomowe.
+# i.e. the routes of one expert are in ascending route index. Two kernels, O(n):
+#   1. _det_route_block_hist_kernel: histogram over experts of the routes in
+#      each BLOCK_T block -> hist[block, e] (no atomics; only when blocks > 1);
+#   2. _det_route_place_kernel: rank within the block (tiled comparisons) + sum
+#      of hist[b < pid, e] -> store into packed_route_indices.
+# No host synchronisation: works in CUDA graphs (hist comes from torch.empty in
+# the graph pool). Contract difference: expert_offsets is NOT advanced (it stays
+# the prefix from the prefix/small_prefix kernel); nothing in this image reads
+# it after packing.
+# Diagnostic switch, read once at import time (default 1 = on):
+#   B12X_DETERMINISM_ROUTE_PACK=0 -> original atomic kernel.
 _DET_ROUTE_PACK = (
     __import__("os").environ.get("B12X_DETERMINISM_ROUTE_PACK", "1") != "0"
 )
@@ -382,12 +384,12 @@ def _det_route_place_kernel(
     ids, valid = _det_route_ids(
         topk_ids, expert_map, offsets, live_numel, NUM_EXPERTS, HAS_EXPERT_MAP
     )
-    # Nieważne trasy bloku: klucz -2 (poprzednicy nieważni mają -1), więc nigdy
-    # nie zrównują się z ważnym id; ich wynik i tak jest maskowany przy zapisie.
+    # Invalid routes of the block get key -2 (invalid predecessors have -1), so
+    # they never equal a valid id; their result is masked at the store anyway.
     ids = tl.where(valid, ids, -2)
     tile = tl.arange(0, _DET_TILE)
     ranks = tl.zeros((BLOCK_T,), dtype=tl.int32)
-    # 1) wcześniejsze trasy tego samego bloku
+    # 1) earlier routes of the same block
     for j0 in tl.static_range(0, BLOCK_T, _DET_TILE):
         j_offsets = pid * BLOCK_T + j0 + tile
         j_ids, j_valid = _det_route_ids(
@@ -395,7 +397,7 @@ def _det_route_place_kernel(
         )
         hit = (ids[:, None] == j_ids[None, :]) & (j_offsets[None, :] < offsets[:, None])
         ranks += tl.sum(hit.to(tl.int32), axis=1)
-    # 2) trasy wcześniejszych bloków: suma hist[b < pid, e] w kaflach ekspertów
+    # 2) routes of earlier blocks: sum of hist[b < pid, e] over expert tiles
     if HAS_PREFIX:
         for e0 in tl.static_range(0, BLOCK_E, _DET_TILE):
             experts = e0 + tile
@@ -425,11 +427,12 @@ def _det_pack_routes_stable(
     num_experts: int,
     launches: "W4A16RoutePackLaunches | None" = None,
 ) -> None:
-    """Stabilny odpowiednik uruchomienia _pack_topk_routes_sort_kernel (patrz wyżej).
+    """Stable equivalent of the _pack_topk_routes_sort_kernel launch (see above).
 
-    Z przygotowanymi programami (launches; tak jedzie serwer: faza b12x bez
-    kompilacji przyjmuje tylko programy zbudowane w compile_w4a16_route_pack_launches)
-    albo przez launch_triton (planowanie / wywołania bez przygotowania).
+    Runs with prepared programs (launches; this is what the server uses: the b12x
+    no-compilation phase accepts only programs built in
+    compile_w4a16_route_pack_launches) or through launch_triton (planning /
+    calls without preparation).
     """
     blocks = triton.cdiv(int(numel), _SORT_BLOCK_T)
     block_e = _next_power_of_2(int(num_experts))
@@ -439,7 +442,7 @@ def _det_pack_routes_stable(
             blocks * int(num_experts), dtype=torch.int32, device=topk_ids.device
         )
     else:
-        hist = expert_offsets  # nieużywany przy HAS_PREFIX=False
+        hist = expert_offsets  # unused when HAS_PREFIX=False
     if launches is not None:
         if has_prefix:
             _launch_prepared(
@@ -621,8 +624,8 @@ def compile_w4a16_route_pack_launches(
                     grid=(triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T), 1, 1),
                 )
                 if _DET_ROUTE_PACK:
-                    # [determinism] D2: programy stabilnego pakowania tras, budowane
-                    # razem z resztą (faza bez kompilacji nie przyjmie nowych).
+                    # [determinism] Stable route-packing programs, built together
+                    # with the rest (the no-compilation phase rejects new ones).
                     det_grid = (
                         triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T),
                         1,
@@ -1037,8 +1040,8 @@ def pack_topk_routes_by_expert(
                 block_e.bit_length(),
             )
     if _DET_ROUTE_PACK:
-        # [determinism] D2: stabilne rangi zamiast atomowych (także przy
-        # przygotowanych programach i w trakcie przechwytywania grafu).
+        # [determinism] Stable ranks instead of atomic ones (also with prepared
+        # programs and during CUDA-graph capture).
         _det_pack_routes_stable(
             topk_ids,
             expert_map_tensor,
