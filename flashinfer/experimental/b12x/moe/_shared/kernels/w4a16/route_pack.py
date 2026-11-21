@@ -296,6 +296,216 @@ def _pack_topk_routes_sort_kernel(
     tl.store(packed_route_indices + ranks, offsets, mask=valid)
 
 
+# [determinism] Nakładka overlay/determinism (D2). Oryginalne jądro wyżej nadaje
+# trasie miejsce w segmencie eksperta przez tl.atomic_add z wielu wątków/CTA, więc
+# kolejność tras w obrębie eksperta (a z nią kolejność sumowania w GEMM-ach MoE)
+# zależy od przebiegu. Zamiennik: trasa i dostaje miejsce
+#   expert_offsets[e] + #{j < i : ids[j] == e},
+# czyli trasy jednego eksperta leżą rosnąco po indeksie trasy. Dwa jądra, O(n):
+#   1. _det_route_block_hist_kernel: histogram tras bloku BLOCK_T po ekspertach
+#      -> hist[blok, e] (bez atomików; tylko gdy bloków > 1);
+#   2. _det_route_place_kernel: ranga w bloku (porównania w kaflach) + suma
+#      hist[b < pid, e] -> zapis do packed_route_indices.
+# Bez synchronizacji z hostem: działa w grafach CUDA (hist z torch.empty z puli
+# grafu). Różnica kontraktu: expert_offsets NIE jest przesuwany (zostaje prefiksem
+# z jądra prefix/small_prefix); w tym obrazie nikt go nie czyta po pakowaniu.
+# Przełącznik diagnostyczny czytany raz przy imporcie (domyślnie 1):
+#   B12X_DETERMINISM_ROUTE_PACK=0 -> oryginalne jądro atomowe.
+_DET_ROUTE_PACK = (
+    __import__("os").environ.get("B12X_DETERMINISM_ROUTE_PACK", "1") != "0"
+)
+_DET_TILE = tl.constexpr(32)
+
+
+@triton.jit
+def _det_route_ids(
+    topk_ids,
+    expert_map,
+    offsets,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+):
+    raw_ids = tl.load(topk_ids + offsets, mask=offsets < live_numel, other=-1).to(
+        tl.int32
+    )
+    valid = (offsets < live_numel) & (raw_ids >= 0) & (raw_ids < NUM_EXPERTS)
+    ids = raw_ids
+    if HAS_EXPERT_MAP:
+        safe_ids = tl.minimum(tl.maximum(raw_ids, 0), NUM_EXPERTS - 1)
+        ids = tl.load(expert_map + safe_ids, mask=valid, other=-1).to(tl.int32)
+        valid = valid & (ids >= 0) & (ids < NUM_EXPERTS)
+    return tl.where(valid, ids, -1), valid
+
+
+@triton.jit(do_not_specialize=["live_numel"])
+def _det_route_block_hist_kernel(
+    topk_ids,
+    expert_map,
+    hist,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    ids, valid = _det_route_ids(
+        topk_ids, expert_map, offsets, live_numel, NUM_EXPERTS, HAS_EXPERT_MAP
+    )
+    for e0 in tl.static_range(0, BLOCK_E, _DET_TILE):
+        experts = e0 + tl.arange(0, _DET_TILE)
+        hit = ids[:, None] == experts[None, :]
+        counts = tl.sum(hit.to(tl.int32), axis=0)
+        tl.store(
+            hist + pid * NUM_EXPERTS + experts, counts, mask=experts < NUM_EXPERTS
+        )
+
+
+@triton.jit(do_not_specialize=["live_numel"])
+def _det_route_place_kernel(
+    topk_ids,
+    expert_map,
+    packed_route_indices,
+    expert_offsets,
+    hist,
+    live_numel,
+    NUM_EXPERTS: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+    HAS_PREFIX: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_T + tl.arange(0, BLOCK_T)
+    ids, valid = _det_route_ids(
+        topk_ids, expert_map, offsets, live_numel, NUM_EXPERTS, HAS_EXPERT_MAP
+    )
+    # Nieważne trasy bloku: klucz -2 (poprzednicy nieważni mają -1), więc nigdy
+    # nie zrównują się z ważnym id; ich wynik i tak jest maskowany przy zapisie.
+    ids = tl.where(valid, ids, -2)
+    tile = tl.arange(0, _DET_TILE)
+    ranks = tl.zeros((BLOCK_T,), dtype=tl.int32)
+    # 1) wcześniejsze trasy tego samego bloku
+    for j0 in tl.static_range(0, BLOCK_T, _DET_TILE):
+        j_offsets = pid * BLOCK_T + j0 + tile
+        j_ids, j_valid = _det_route_ids(
+            topk_ids, expert_map, j_offsets, live_numel, NUM_EXPERTS, HAS_EXPERT_MAP
+        )
+        hit = (ids[:, None] == j_ids[None, :]) & (j_offsets[None, :] < offsets[:, None])
+        ranks += tl.sum(hit.to(tl.int32), axis=1)
+    # 2) trasy wcześniejszych bloków: suma hist[b < pid, e] w kaflach ekspertów
+    if HAS_PREFIX:
+        for e0 in tl.static_range(0, BLOCK_E, _DET_TILE):
+            experts = e0 + tile
+            e_mask = experts < NUM_EXPERTS
+            pref = tl.zeros((_DET_TILE,), dtype=tl.int32)
+            for b0 in tl.range(0, pid, _DET_TILE):
+                blocks = b0 + tile
+                part = tl.load(
+                    hist + blocks[:, None] * NUM_EXPERTS + experts[None, :],
+                    mask=(blocks[:, None] < pid) & e_mask[None, :],
+                    other=0,
+                )
+                pref += tl.sum(part, axis=0)
+            hit = ids[:, None] == experts[None, :]
+            ranks += tl.sum(tl.where(hit, pref[None, :], 0), axis=1)
+    base = tl.load(expert_offsets + ids, mask=valid, other=0)
+    tl.store(packed_route_indices + base + ranks, offsets, mask=valid)
+
+
+def _det_pack_routes_stable(
+    topk_ids: torch.Tensor,
+    expert_map_tensor: torch.Tensor,
+    has_expert_map: bool,
+    packed_route_indices: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    numel: int,
+    num_experts: int,
+    launches: "W4A16RoutePackLaunches | None" = None,
+) -> None:
+    """Stabilny odpowiednik uruchomienia _pack_topk_routes_sort_kernel (patrz wyżej).
+
+    Z przygotowanymi programami (launches; tak jedzie serwer: faza b12x bez
+    kompilacji przyjmuje tylko programy zbudowane w compile_w4a16_route_pack_launches)
+    albo przez launch_triton (planowanie / wywołania bez przygotowania).
+    """
+    blocks = triton.cdiv(int(numel), _SORT_BLOCK_T)
+    block_e = _next_power_of_2(int(num_experts))
+    has_prefix = blocks > 1
+    if has_prefix:
+        hist = torch.empty(
+            blocks * int(num_experts), dtype=torch.int32, device=topk_ids.device
+        )
+    else:
+        hist = expert_offsets  # nieużywany przy HAS_PREFIX=False
+    if launches is not None:
+        if has_prefix:
+            _launch_prepared(
+                launches.program("det_hist", topk_ids, has_expert_map),
+                (blocks,),
+                topk_ids,
+                expert_map_tensor,
+                hist,
+                numel,
+                int(num_experts),
+                has_expert_map,
+                _SORT_BLOCK_T,
+                block_e,
+            )
+        _launch_prepared(
+            launches.program(
+                "det_place_prefix" if has_prefix else "det_place",
+                topk_ids,
+                has_expert_map,
+            ),
+            (blocks,),
+            topk_ids,
+            expert_map_tensor,
+            packed_route_indices,
+            expert_offsets,
+            hist,
+            numel,
+            int(num_experts),
+            has_expert_map,
+            _SORT_BLOCK_T,
+            block_e,
+            has_prefix,
+        )
+        return
+    if has_prefix:
+        launch_triton(
+            _det_route_block_hist_kernel,
+            (blocks,),
+            topk_ids,
+            expert_map_tensor,
+            hist,
+            numel,
+            NUM_EXPERTS=int(num_experts),
+            HAS_EXPERT_MAP=has_expert_map,
+            BLOCK_T=_SORT_BLOCK_T,
+            BLOCK_E=block_e,
+            num_warps=4,
+        )
+    launch_triton(
+        _det_route_place_kernel,
+        (blocks,),
+        topk_ids,
+        expert_map_tensor,
+        packed_route_indices,
+        expert_offsets,
+        hist,
+        numel,
+        NUM_EXPERTS=int(num_experts),
+        HAS_EXPERT_MAP=has_expert_map,
+        BLOCK_T=_SORT_BLOCK_T,
+        BLOCK_E=block_e,
+        HAS_PREFIX=has_prefix,
+        num_warps=4,
+    )
+
+
 @dataclass(frozen=True)
 class W4A16RoutePackLaunches:
     """Exact prepared Triton objects for one W4A16 packed-route geometry."""
@@ -410,6 +620,47 @@ def compile_w4a16_route_pack_launches(
                     num_warps=4,
                     grid=(triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T), 1, 1),
                 )
+                if _DET_ROUTE_PACK:
+                    # [determinism] D2: programy stabilnego pakowania tras, budowane
+                    # razem z resztą (faza bez kompilacji nie przyjmie nowych).
+                    det_grid = (
+                        triton.cdiv(int(tokens) * int(topk), _SORT_BLOCK_T),
+                        1,
+                        1,
+                    )
+                    programs[("det_hist", *key)] = (
+                        _det_route_block_hist_kernel.warmup(
+                            ids_dtype,
+                            expert_map_dtype,
+                            torch.int32,
+                            live_numel,
+                            NUM_EXPERTS=int(num_experts),
+                            HAS_EXPERT_MAP=has_expert_map,
+                            BLOCK_T=_SORT_BLOCK_T,
+                            BLOCK_E=block_e,
+                            num_warps=4,
+                            grid=det_grid,
+                        )
+                    )
+                    for det_name, det_prefix in (
+                        ("det_place", False),
+                        ("det_place_prefix", True),
+                    ):
+                        programs[(det_name, *key)] = _det_route_place_kernel.warmup(
+                            ids_dtype,
+                            expert_map_dtype,
+                            torch.int32,
+                            torch.int32,
+                            torch.int32,
+                            live_numel,
+                            NUM_EXPERTS=int(num_experts),
+                            HAS_EXPERT_MAP=has_expert_map,
+                            BLOCK_T=_SORT_BLOCK_T,
+                            BLOCK_E=block_e,
+                            HAS_PREFIX=det_prefix,
+                            num_warps=4,
+                            grid=det_grid,
+                        )
         if not use_small_prefix:
             programs[("prefix", torch.int32, False)] = (
                 _w4a16_route_prefix_from_counts_kernel.warmup(
@@ -785,7 +1036,20 @@ def pack_topk_routes_by_expert(
                 _POST_PREFIX_BLOCK_T,
                 block_e.bit_length(),
             )
-    if launches is None:
+    if _DET_ROUTE_PACK:
+        # [determinism] D2: stabilne rangi zamiast atomowych (także przy
+        # przygotowanych programach i w trakcie przechwytywania grafu).
+        _det_pack_routes_stable(
+            topk_ids,
+            expert_map_tensor,
+            expert_map is not None,
+            packed_route_indices,
+            expert_offsets,
+            numel,
+            int(num_experts),
+            launches,
+        )
+    elif launches is None:
         launch_triton(
             _pack_topk_routes_sort_kernel,
             sort_grid,
