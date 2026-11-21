@@ -56,6 +56,75 @@ def _tensor_from_pointer(
     )
 
 
+# --- fast-boot overlay (karmic_ds41f/overlay/fast-boot) -----------------------
+# cudaHostAlloc builds the allocation page by page inside the driver and does
+# not scale across the TP workers that allocate at the same time (4 x 47 GiB:
+# ~20 s). An anonymous mapping populated here and then registered with CUDA
+# gives the same mapped page-locked memory in about a third of that.
+# B12X_MAPPED_HOST_REGISTER=0 restores cudaHostAlloc; any failure on this path
+# falls back to it as well. Huge pages (B12X_MAPPED_HOST_HUGEPAGES=1) are a
+# little faster with plenty of free memory but stall in direct compaction when
+# the page cache is full (measured 25 s against 7 s), so they stay off.
+_THP_MIN_BYTES = 64 << 20
+_MADV_DONTFORK, _MADV_HUGEPAGE, _MADV_POPULATE_WRITE = 10, 14, 23
+_libc = None
+
+
+def _libc_handle():
+    global _libc
+    if _libc is None:
+        import ctypes
+
+        lib = ctypes.CDLL(None, use_errno=True)
+        lib.mmap.restype = ctypes.c_void_p
+        lib.mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        lib.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        lib.madvise.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        _libc = lib
+    return _libc
+
+
+def _registered_thp_alloc(nbytes: int) -> tuple[int, int] | None:
+    """Return (host pointer, mapped length) of registered memory, or None."""
+    from cuda.bindings import runtime as cudart
+
+    if (
+        os.environ.get("B12X_MAPPED_HOST_REGISTER", "1") == "0"
+        or nbytes < _THP_MIN_BYTES
+    ):
+        return None
+    lib = _libc_handle()
+    length = (nbytes + (2 << 20) - 1) & ~((2 << 20) - 1)
+    # PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
+    pointer = lib.mmap(None, length, 0x3, 0x22, -1, 0)
+    if pointer is None or pointer == (1 << 64) - 1:
+        return None
+    try:
+        # A forked child must not inherit page-locked pages: the kernel would
+        # copy all of them at fork time.
+        if lib.madvise(pointer, length, _MADV_DONTFORK) != 0:
+            raise OSError("MADV_DONTFORK")
+        if os.environ.get("B12X_MAPPED_HOST_HUGEPAGES", "0") == "1":
+            lib.madvise(pointer, length, _MADV_HUGEPAGE)
+        lib.madvise(pointer, length, _MADV_POPULATE_WRITE)
+        (error,) = cudart.cudaHostRegister(
+            pointer, length, cudart.cudaHostRegisterMapped
+        )
+        if error != cudart.cudaError_t.cudaSuccess:
+            raise RuntimeError(f"cudaHostRegister failed: {error}")
+    except Exception:
+        lib.munmap(pointer, length)
+        return None
+    return int(pointer), length
+
+
 class MappedHostAllocation:
     """Own a mapped page-locked allocation and its CPU/CUDA tensor aliases."""
 
@@ -77,11 +146,17 @@ class MappedHostAllocation:
             )
         self.device = device
         self.nbytes = nbytes
+        self._registered_length = 0
         with torch.cuda.device(device):
-            error, pointer = cudart.cudaHostAlloc(
-                nbytes, cudart.cudaHostAllocMapped | cudart.cudaHostAllocWriteCombined
-            )
-            _check_cuda(error, "cudaHostAlloc")
+            registered = _registered_thp_alloc(nbytes)
+            if registered is not None:
+                pointer, self._registered_length = registered
+            else:
+                error, pointer = cudart.cudaHostAlloc(
+                    nbytes,
+                    cudart.cudaHostAllocMapped | cudart.cudaHostAllocWriteCombined,
+                )
+                _check_cuda(error, "cudaHostAlloc")
             self._host_pointer = int(pointer)
             self._closed = False
             try:
@@ -102,7 +177,7 @@ class MappedHostAllocation:
                     nbytes=nbytes,
                 )
             except Exception:
-                cudart.cudaFreeHost(pointer)
+                self._release()
                 self._host_pointer = 0
                 self._closed = True
                 raise
@@ -113,9 +188,19 @@ class MappedHostAllocation:
         if self._closed:
             return
         torch.cuda.synchronize(self.device)
-        _check_cuda(cudart.cudaFreeHost(self._host_pointer)[0], "cudaFreeHost")
+        _check_cuda(self._release(), "cudaFreeHost")
         self._host_pointer = 0
         self._closed = True
+
+    def _release(self) -> cudart.cudaError_t:
+        from cuda.bindings import runtime as cudart
+
+        if not self._registered_length:
+            return cudart.cudaFreeHost(self._host_pointer)[0]
+        error = cudart.cudaHostUnregister(self._host_pointer)[0]
+        _libc_handle().munmap(self._host_pointer, self._registered_length)
+        self._registered_length = 0
+        return error
 
     def __del__(self) -> None:
         if (
