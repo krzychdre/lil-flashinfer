@@ -3158,13 +3158,20 @@ _FUSED_INDEXER_PRISTINE_CODE = {
     "__call__": DSAFusedIndexerKernel.__call__.__wrapped__.__code__,
     "kernel": DSAFusedIndexerKernel.kernel.__wrapped__.__code__,
 }
-_FUSED_INDEXER_VARIANT_COUNTER = 0
 
 
-def _fused_indexer_variant_class():
-    global _FUSED_INDEXER_VARIANT_COUNTER
-    tag = _FUSED_INDEXER_VARIANT_COUNTER
-    _FUSED_INDEXER_VARIANT_COUNTER += 1
+def _fused_indexer_variant_class(params):
+    # The variant tag is part of the qualnames below, and qualnames are part of
+    # the CuTe compile key. A per-process counter gave the same variant
+    # different keys in the preparation planner and in a compile worker (the
+    # n-th variant built in one process is the first in a fresh worker), so
+    # b12x preparation failed with "factory program keys changed between
+    # planning and compilation". Derive the tag from the variant's parameters:
+    # still unique per variant (callers memoize on the same parameters), and
+    # identical in every process.
+    import hashlib
+
+    tag = hashlib.sha256(repr(params).encode("utf-8")).hexdigest()[:16]
 
     def _copy(name, decorator):
         orig = getattr(DSAFusedIndexerKernel, name).__wrapped__
@@ -3204,7 +3211,21 @@ def _build_fused_indexer_kernel(
     vectorized_q_load: bool = False,
     q_row_stride_bytes: int = 0,
 ):
-    return _fused_indexer_variant_class()(
+    params = (
+        kv_layout,
+        num_heads_static,
+        topk,
+        paged_output,
+        ctas_per_group,
+        num_sms,
+        merge_threshold,
+        k_quant_page_stride,
+        k_scales_row_stride,
+        max_seq_capacity,
+        vectorized_q_load,
+        q_row_stride_bytes,
+    )
+    return _fused_indexer_variant_class(params)(
         num_heads_static=num_heads_static,
         topk=topk,
         kv_layout=kv_layout,
